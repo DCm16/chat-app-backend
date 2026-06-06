@@ -3,10 +3,10 @@ const Conversation = require("../models/Conversation.model");
 const User = require("../models/User.model");
 const { verifyToken } = require("../utils/jwt.utils");
 
-const onlineUsers = new Map(); // socketId → { userId?, conversationId?, senderType, username }
+const onlineUsers = new Map();
 
 module.exports = (io) => {
-  // Socket auth middleware — handles both admin JWT and guest token
+  // ── Socket auth middleware ─────────────────────────────────────────
   io.use((socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
@@ -15,11 +15,9 @@ module.exports = (io) => {
       const decoded = verifyToken(token);
 
       if (decoded?.id) {
-        // Admin user
         socket.senderType = "admin";
         socket.userId = decoded.id;
       } else if (decoded?.conversationId && decoded?.guestUsername) {
-        // Guest user
         socket.senderType = "guest";
         socket.conversationId = decoded.conversationId;
         socket.guestUsername = decoded.guestUsername;
@@ -41,23 +39,23 @@ module.exports = (io) => {
       return;
     }
 
-    onlineUsers.set(socket.id, { senderType, userId, conversationId, guestUsername });
+    onlineUsers.set(socket.id, {
+      senderType,
+      userId,
+      conversationId,
+      guestUsername,
+    });
 
     // ── room:join ──────────────────────────────────────────────────────
-    // Admin can join any conversation they own
-    // Guest can only join their own conversationId
     socket.on("room:join", async (roomId) => {
       if (!roomId || typeof roomId !== "string") return;
-
       try {
         if (senderType === "guest") {
-          // Guests can only join their own conversation
           if (roomId !== conversationId) {
             socket.emit("error", { message: "Access denied" });
             return;
           }
         }
-
         socket.join(roomId);
         socket.emit("room:joined", { room: roomId });
         socket.to(roomId).emit("room:user_joined", {
@@ -65,12 +63,10 @@ module.exports = (io) => {
           username: senderType === "admin" ? null : guestUsername,
           room: roomId,
         });
-
-        // Mark guest messages as read when admin joins
         if (senderType === "admin") {
           await Message.updateMany(
             { conversation: roomId, senderType: "guest", readAt: null },
-            { readAt: new Date() }
+            { readAt: new Date() },
           );
           socket.emit("messages:read", { conversationId: roomId });
         }
@@ -96,13 +92,13 @@ module.exports = (io) => {
         if (!room || !content?.trim())
           return callback?.({ error: "Invalid payload" });
 
-        // Guests can only send to their own conversation
         if (senderType === "guest" && room !== conversationId)
           return callback?.({ error: "Access denied" });
 
         const senderUsername =
           senderType === "admin"
-            ? (await User.findById(userId).select("username"))?.username || "Admin"
+            ? (await User.findById(userId).select("username"))?.username ||
+              "Admin"
             : guestUsername;
 
         const message = await Message.create({
@@ -112,8 +108,9 @@ module.exports = (io) => {
           content: content.trim(),
         });
 
-        // Update conversation's lastMessageAt
-        await Conversation.findByIdAndUpdate(room, { lastMessageAt: new Date() });
+        await Conversation.findByIdAndUpdate(room, {
+          lastMessageAt: new Date(),
+        });
 
         io.to(room).emit("message:new", message);
         callback?.({ success: true, message });
@@ -125,11 +122,17 @@ module.exports = (io) => {
 
     // ── typing indicators ──────────────────────────────────────────────
     socket.on("typing:start", ({ room }) => {
-      if (room) socket.to(room).emit("typing:start", { senderType, username: guestUsername });
+      if (room)
+        socket
+          .to(room)
+          .emit("typing:start", { senderType, username: guestUsername });
     });
 
     socket.on("typing:stop", ({ room }) => {
-      if (room) socket.to(room).emit("typing:stop", { senderType, username: guestUsername });
+      if (room)
+        socket
+          .to(room)
+          .emit("typing:stop", { senderType, username: guestUsername });
     });
 
     // ── message:delete ─────────────────────────────────────────────────
@@ -144,8 +147,7 @@ module.exports = (io) => {
           msg.senderType === "guest" &&
           msg.conversation.toString() === conversationId;
 
-        if (!isAdmin && !isGuest)
-          return callback?.({ error: "Forbidden" });
+        if (!isAdmin && !isGuest) return callback?.({ error: "Forbidden" });
 
         msg.isDeleted = true;
         await msg.save();
@@ -156,12 +158,76 @@ module.exports = (io) => {
       }
     });
 
+    // ── call:start ─────────────────────────────────────────────────────
+    // Caller notifies the other peer a call is incoming
+    socket.on("call:start", ({ room, callType }) => {
+      if (!room || !callType) return;
+      if (senderType === "guest" && room !== conversationId) return;
+      socket.to(room).emit("call:incoming", {
+        from: socket.senderType,
+        callType,
+        roomId: room,
+      });
+    });
+
+    // ── call:offer ─────────────────────────────────────────────────────
+    // Caller sends SDP offer to receiver
+    socket.on("call:offer", ({ room, offer }) => {
+      if (!room || !offer) return;
+      socket.to(room).emit("call:offer", { offer });
+    });
+
+    // ── call:answer ────────────────────────────────────────────────────
+    // Receiver sends SDP answer back to caller
+    socket.on("call:answer", ({ room, answer }) => {
+      if (!room || !answer) return;
+      socket.to(room).emit("call:answer", { answer });
+    });
+
+    // ── call:ice ───────────────────────────────────────────────────────
+    // Both peers exchange ICE candidates
+    socket.on("call:ice", ({ room, candidate }) => {
+      if (!room || !candidate) return;
+      socket.to(room).emit("call:ice", { candidate });
+    });
+
+    // ── call:end ───────────────────────────────────────────────────────
+    // Either peer ends the call
+    socket.on("call:end", ({ room }) => {
+      if (!room) return;
+      socket.to(room).emit("call:ended");
+    });
+
+    // ── call:reject ────────────────────────────────────────────────────
+    // Receiver rejects the incoming call
+    socket.on("call:reject", ({ room }) => {
+      if (!room) return;
+      socket.to(room).emit("call:rejected");
+    });
+
+    // ── call:screen-share ──────────────────────────────────────────────
+    // Relay screen share state change to the other peer
+    socket.on("call:screen-share", ({ room, active }) => {
+      if (!room || typeof active !== "boolean") return;
+      if (senderType === "guest" && room !== conversationId) return;
+      socket.to(room).emit("call:screen-share", { active });
+    });
+
     // ── disconnect ─────────────────────────────────────────────────────
     socket.on("disconnect", async () => {
       onlineUsers.delete(socket.id);
 
+      // End any active call when peer disconnects
+      socket.rooms.forEach((room) => {
+        if (room !== socket.id) {
+          socket.to(room).emit("call:ended");
+        }
+      });
+
       if (senderType === "admin" && userId) {
-        const stillOnline = [...onlineUsers.values()].some((u) => u.userId === userId);
+        const stillOnline = [...onlineUsers.values()].some(
+          (u) => u.userId === userId,
+        );
         if (!stillOnline) {
           try {
             await User.findByIdAndUpdate(userId, { isOnline: false });
@@ -173,7 +239,7 @@ module.exports = (io) => {
       }
     });
 
-    // Set admin online
+    // Set admin online on connect
     if (senderType === "admin" && userId) {
       User.findByIdAndUpdate(userId, { isOnline: true })
         .then(() => io.emit("user:online", { userId }))
